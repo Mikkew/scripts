@@ -41,8 +41,16 @@ def convertir_pdf_a_imagenes(archivo_pdf, carpeta_salida, formato='jpg', dpi=200
     
     try:
         print(f"\n📂 Abriendo PDF: {archivo_pdf}...")
+        
+        # Abrir PDF con opciones más tolerantes
         doc = fitz.open(archivo_pdf)
         total_paginas = len(doc)
+        
+        if total_paginas == 0:
+            print("❌ Error: El PDF no tiene páginas.")
+            doc.close()
+            input("\nPresiona Enter para salir...")
+            sys.exit(1)
         
         print(f"📊 Total de páginas: {total_paginas}")
         print(f"🖼️  Formato de salida: {formato.upper()}")
@@ -50,41 +58,122 @@ def convertir_pdf_a_imagenes(archivo_pdf, carpeta_salida, formato='jpg', dpi=200
         print(f"\n🚗 Iniciando conversión...\n")
         
         imagenes_generadas = 0
+        paginas_saltadas = 0
+        paginas_con_error = []
         
         for num_pagina in range(total_paginas):
-            pagina = doc.load_page(num_pagina)
-            
-            # Configurar matriz de zoom para la resolución
-            zoom = dpi / 72  # 72 DPI es el estándar de PDF
-            mat = fitz.Matrix(zoom, zoom)
-            
-            # Renderizar página a imagen
-            pix = pagina.get_pixmap(matrix=mat)
-            
-            # Generar nombre de archivo
-            nombre_archivo = f"pagina_{num_pagina + 1:03d}.{formato}"
-            ruta_salida = os.path.join(carpeta_salida, nombre_archivo)
-            
-            # Guardar imagen
-            if formato == 'jpg':
-                pix.save(ruta_salida, output='jpeg', jpg_quality=95)
-            else:
-                pix.save(ruta_salida, output='png')
-            
-            imagenes_generadas += 1
-            print(f"  ✅ Página {num_pagina + 1}/{total_paginas} → {nombre_archivo}")
+            try:
+                pagina = doc.load_page(num_pagina)
+                
+                # Obtener dimensiones de la página
+                rect = pagina.rect
+                ancho = rect.width
+                alto = rect.height
+                
+                # Validar dimensiones de la página
+                if ancho <= 0 or alto <= 0:
+                    print(f"  ⚠️  Página {num_pagina + 1}: Dimensiones inválidas ({ancho}x{alto}). Saltando...")
+                    paginas_saltadas += 1
+                    paginas_con_error.append(num_pagina + 1)
+                    continue
+                
+                # Configurar matriz de zoom para la resolución
+                zoom = dpi / 72  # 72 DPI es el estándar de PDF
+                
+                # Validar zoom
+                if zoom <= 0:
+                    zoom = 1  # Zoom mínimo
+                
+                mat = fitz.Matrix(zoom, zoom)
+                
+                # Calcular dimensiones resultantes
+                ancho_imagen = int(ancho * zoom)
+                alto_imagen = int(alto * zoom)
+                
+                # Validar dimensiones de imagen resultantes
+                if ancho_imagen <= 0 or alto_imagen <= 0:
+                    print(f"  ⚠️  Página {num_pagina + 1}: Dimensiones de imagen inválidas ({ancho_imagen}x{alto_imagen}). Saltando...")
+                    paginas_saltadas += 1
+                    paginas_con_error.append(num_pagina + 1)
+                    continue
+                
+                # Dimensiones mínimas (evitar errores de MuPDF)
+                if ancho_imagen < 10 or alto_imagen < 10:
+                    print(f"  ⚠️  Página {num_pagina + 1}: Imagen demasiado pequeña ({ancho_imagen}x{alto_imagen}). Saltando...")
+                    paginas_saltadas += 1
+                    paginas_con_error.append(num_pagina + 1)
+                    continue
+                
+                # Renderizar página a imagen
+                pix = pagina.get_pixmap(matrix=mat)
+                
+                # Validar pixmap
+                if pix.width <= 0 or pix.height <= 0:
+                    print(f"  ⚠️  Página {num_pagina + 1}: Pixmap inválido. Saltando...")
+                    paginas_saltadas += 1
+                    paginas_con_error.append(num_pagina + 1)
+                    continue
+                
+                # Generar nombre de archivo
+                nombre_archivo = f"pagina_{num_pagina + 1:03d}.{formato}"
+                ruta_salida = os.path.join(carpeta_salida, nombre_archivo)
+                
+                # Guardar imagen con manejo de errores
+                try:
+                    if formato == 'jpg':
+                        pix.save(ruta_salida, output='jpeg', jpg_quality=95)
+                    else:
+                        pix.save(ruta_salida, output='png')
+                    
+                    imagenes_generadas += 1
+                    print(f"  ✅ Página {num_pagina + 1}/{total_paginas} → {nombre_archivo} ({ancho_imagen}x{alto_imagen})")
+                    
+                except Exception as e:
+                    print(f"  ❌ Página {num_pagina + 1}: Error al guardar imagen: {e}")
+                    paginas_saltadas += 1
+                    paginas_con_error.append(num_pagina + 1)
+                
+                # Limpiar memoria
+                pix = None
+                pagina = None
+                
+            except Exception as e:
+                print(f"  ❌ Página {num_pagina + 1}: Error al procesar: {e}")
+                paginas_saltadas += 1
+                paginas_con_error.append(num_pagina + 1)
+                continue
         
         doc.close()
         
+        # Resumen final
         print("\n" + "="*60)
+        
+        if imagenes_generadas == 0:
+            print("❌ ¡CONVERSIÓN FALLIDA! No se pudo generar ninguna imagen.")
+            if paginas_con_error:
+                print(f"📋 Páginas con error: {paginas_con_error}")
+            print("="*60)
+            input("\nPresiona Enter para salir...")
+            sys.exit(1)
+        
         print("✅ ¡CONVERSIÓN COMPLETADA EXITOSAMENTE!")
         print("="*60)
         print(f"📁 Carpeta de salida: {os.path.abspath(carpeta_salida)}")
         print(f"📊 Imágenes generadas: {imagenes_generadas}")
+        print(f"⚠️  Páginas saltadas: {paginas_saltadas}")
+        
+        if paginas_con_error:
+            print(f"📋 Páginas con error: {paginas_con_error}")
+        
         print(f"🖼️  Formato: {formato.upper()}")
         print(f"📐 Resolución: {dpi} DPI")
         print("="*60)
         
+    except fitz.FileDataError as e:
+        print(f"\n❌ Error: El archivo PDF está corrupto o dañado.")
+        print(f"   Detalle: {e}")
+        input("\nPresiona Enter para salir...")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error inesperado: {e}")
         import traceback
