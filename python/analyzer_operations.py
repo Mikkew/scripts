@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Analizador de duplicados en propiedades de entorno Kubernetes.
-EXTRAE ÚNICAMENTE lo ubicado dentro de secciones 'env'
-Genera reporte detallado de variables repetidas
+Extrae automáticamente owner/repo del configPath en el YAML de configuración
 """
 
 import os
@@ -13,29 +12,85 @@ import requests
 import yaml
 from collections import defaultdict
 from datetime import datetime
+from urllib.parse import urlparse
 
-def get_raw_file(repo_path, branch, owner, repo, token):
+def get_raw_file(repo_path, branch, owner, repo, token, base_url="https://api.github.com"):
     """Descarga contenido crudo de un archivo desde GitHub"""
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{repo_path}"
+    url = f"{base_url}/repos/{owner}/{repo}/contents/{repo_path}"
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3.raw",
         "User-Agent": "K8s-Env-Analyzer"
     }
-    resp = requests.get(url, headers=headers, params={"ref": branch})
+    resp = requests.get(url, headers=headers, params={"ref": branch}, verify=False)
     resp.raise_for_status()
     return resp.text
 
-def parse_config_yaml(content, physical_env, ops_folder, logical_envs):
-    """Resuelve placeholders ${...} y retorna paths por ambiente lógico"""
+def extract_repo_info_from_url(config_path_url):
+    """
+    Extrae owner y repo de una URL de GitHub
+    Ej: https://github.com/owner/repo -> owner, repo
+    Ej: https://alm-github.systems.uk.hsbc/owner/repo -> owner, repo
+    """
+    # Remover trailing slash si existe
+    config_path_url = config_path_url.rstrip('/')
+    
+    # Parsear URL
+    parsed = urlparse(config_path_url)
+    path_parts = parsed.path.strip('/').split('/')
+    
+    if len(path_parts) >= 2:
+        # Asumir que los últimos 2 segmentos son owner/repo
+        # Para URLs como: https://host/owner/repo
+        if len(path_parts) == 2:
+            return path_parts[0], path_parts[1]
+        else:
+            # Tomar los últimos 2 segmentos
+            return path_parts[-2], path_parts[-1]
+    
+    raise ValueError(f"No se pudo extraer owner/repo de la URL: {config_path_url}")
+
+def get_github_api_base_url(config_path_url):
+    """
+    Determina la URL base de la API de GitHub
+    Para github.com -> https://api.github.com
+    Para GitHub Enterprise -> https://host/api/v3 o https://host
+    """
+    parsed = urlparse(config_path_url)
+    hostname = parsed.hostname
+    
+    if hostname == "github.com":
+        return "https://api.github.com"
+    else:
+        # GitHub Enterprise - intentar con /api/v3 primero
+        return f"https://{hostname}"
+
+def parse_config_yaml(content):
+    """
+    Parsea el YAML de configuración y extrae:
+    - configPath (URL del repo)
+    - paths (lista de paths con placeholders)
+    """
     try:
         config_data = yaml.safe_load(content)
     except yaml.YAMLError as e:
         raise ValueError(f"Error al parsear YAML de configuración: {e}")
     
+    # Extraer configPath
+    config_path_url = None
+    if isinstance(config_data, dict):
+        if "defaults" in config_data and isinstance(config_data["defaults"], dict):
+            config_path_url = config_data["defaults"].get("configPath")
+        elif "configPath" in config_data:
+            config_path_url = config_data["configPath"]
+    
+    if not config_path_url:
+        raise ValueError("No se encontró 'configPath' en el YAML de configuración")
+    
+    # Extraer paths
     paths = []
     if isinstance(config_data, dict):
-        if "configuration" in config_data:
+        if "configuration" in config_data and isinstance(config_data["configuration"], dict):
             paths = config_data["configuration"].get("paths", [])
         elif "paths" in config_data:
             paths = config_data["paths"]
@@ -43,23 +98,23 @@ def parse_config_yaml(content, physical_env, ops_folder, logical_envs):
     if not paths:
         raise ValueError("No se encontraron 'paths' en el YAML de configuración")
     
-    paths_by_env = {}
-    for logical_env in logical_envs:
-        resolved = []
-        for tpl in paths:
-            if not isinstance(tpl, str): continue
-            p = tpl.replace("${physicalEnvironment}", physical_env)
-            p = p.replace("${opsrepo_folder}", ops_folder)
-            p = p.replace("${logicalEnvironment}", logical_env)
-            p = re.sub(r'/+', '/', p).lstrip('/')
-            resolved.append(p)
-        paths_by_env[logical_env] = resolved
-    return paths_by_env
+    return config_path_url, paths
+
+def resolve_paths(paths, physical_env, ops_folder, logical_env):
+    """Resuelve placeholders ${...} en los paths"""
+    resolved = []
+    for tpl in paths:
+        if not isinstance(tpl, str): 
+            continue
+        p = tpl.replace("${physicalEnvironment}", physical_env)
+        p = p.replace("${opsrepo_folder}", ops_folder)
+        p = p.replace("${logicalEnvironment}", logical_env)
+        p = re.sub(r'/+', '/', p).lstrip('/')
+        resolved.append(p)
+    return resolved
 
 def extract_env_properties(doc):
-    """
-    Extrae ÚNICAMENTE las propiedades dentro de cualquier sección 'env'.
-    """
+    """Extrae ÚNICAMENTE las propiedades dentro de cualquier sección 'env'"""
     envs = {}
 
     def find_env_section(obj):
@@ -70,11 +125,13 @@ def extract_env_properties(doc):
                     return obj['env']
             for v in obj.values():
                 found = find_env_section(v)
-                if found: return found
+                if found: 
+                    return found
         elif isinstance(obj, list):
             for item in obj:
                 found = find_env_section(item)
-                if found: return found
+                if found: 
+                    return found
         return None
 
     env_dict = find_env_section(doc)
@@ -98,13 +155,9 @@ def parse_env_yaml(content, file_path):
     return all_envs
 
 def find_duplicates(envs_by_file):
-    """
-    Detecta claves repetidas entre archivos del mismo ambiente
-    Retorna información detallada de duplicados
-    """
+    """Detecta claves repetidas entre archivos del mismo ambiente"""
     key_map = defaultdict(list)
     
-    # Mapear cada clave a sus archivos y valores
     for file_path, envs in envs_by_file.items():
         for key, value in envs.items():
             key_map[key].append({
@@ -115,7 +168,7 @@ def find_duplicates(envs_by_file):
 
     duplicates = {}
     for key, occurrences in key_map.items():
-        if len(occurrences) > 1:  # Solo si aparece en más de un archivo
+        if len(occurrences) > 1:
             unique_values = set(o["value"] for o in occurrences)
             duplicates[key] = {
                 "key": key,
@@ -129,7 +182,7 @@ def find_duplicates(envs_by_file):
     
     return duplicates
 
-def analyze_environment(env_name, paths, branch, owner, repo, token):
+def analyze_environment(env_name, paths, branch, owner, repo, token, api_base_url):
     print(f"\n Analizando ambiente: {env_name.upper()}")
     print(f"   📁 {len(paths)} archivos a procesar")
     
@@ -138,7 +191,7 @@ def analyze_environment(env_name, paths, branch, owner, repo, token):
     
     for p in paths:
         try:
-            content = get_raw_file(p, branch, owner, repo, token)
+            content = get_raw_file(p, branch, owner, repo, token, api_base_url)
             envs_by_file[p] = parse_env_yaml(content, p)
             success += 1
             time.sleep(0.2)
@@ -150,15 +203,15 @@ def analyze_environment(env_name, paths, branch, owner, repo, token):
                 print(f"   ❌ Error HTTP {e.response.status_code} en {p}")
                 fail += 1
         except Exception as e:
-            print(f"   ⚠️  Error en {p}: {type(e).__name__}")
+            print(f"   ⚠️  Error en {p}: {type(e).__name__}: {str(e)[:50]}")
             fail += 1
             
     print(f"   ✅ {success} leídos |  {fail} fallidos")
     return find_duplicates(envs_by_file)
 
-def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_folder):
+def generate_txt_report(all_results, repo_url, branch, physical_env, ops_folder):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    output_file = f"reporte_env_duplicados_{repo}_{branch}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    output_file = f"reporte_env_duplicados_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
     lines = []
     
     # Encabezado
@@ -166,7 +219,7 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
     lines.append("REPORTE DE VARIABLES DUPLICADAS EN SECCIÓN 'env' - KUBERNETES")
     lines.append("=" * 90)
     lines.append(f"Generado        : {timestamp}")
-    lines.append(f"Repositorio     : {owner}/{repo}")
+    lines.append(f"Repositorio     : {repo_url}")
     lines.append(f"Rama            : {branch}")
     lines.append(f"Physical Env    : {physical_env}")
     lines.append(f"Ops Folder      : {ops_folder}")
@@ -192,7 +245,6 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
             lines.append("  ✅ NO SE ENCONTRARON VARIABLES DUPLICADAS en este ambiente")
             lines.append("")
         else:
-            # Resumen del ambiente
             files_with_dups = set()
             for key, info in dups.items():
                 for occ in info["occurrences"]:
@@ -204,11 +256,9 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
             lines.append(f"     • Archivos con duplicados: {len(files_with_dups)}")
             lines.append("")
             
-            # Lista de variables repetidas
             lines.append(f"  📋 LISTA DE VARIABLES DUPLICADAS ({len(dups)} variables):")
             lines.append("  " + "-" * 86)
             
-            # Ordenar por número de ocurrencias (mayor primero)
             sorted_dups = sorted(dups.items(), key=lambda x: x[1]["total_occurrences"], reverse=True)
             
             for idx, (key, info) in enumerate(sorted_dups, 1):
@@ -225,7 +275,6 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
                 
                 for occ in info["occurrences"]:
                     val = occ["value"]
-                    # Truncar valor si es muy largo
                     if len(val) > 70:
                         display_val = val[:67] + "..."
                     else:
@@ -240,7 +289,6 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
         lines.append("")
         lines.append("=" * 90)
 
-    # Resumen general final
     lines.append("")
     lines.append("╔" + "═" * 88 + "╗")
     lines.append(f"║  RESUMEN GENERAL DEL REPORTE{' ' * 57} ║")
@@ -251,7 +299,6 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
     lines.append(f"  Ambientes analizados: {len(all_results)}")
     lines.append("")
     
-    # Tabla resumen por ambiente
     lines.append("  DESGLOSE POR AMBIENTE:")
     lines.append("  " + "-" * 86)
     lines.append(f"  {'Ambiente':<15} {'Variables Duplicadas':<25} {'Estado'}")
@@ -266,7 +313,6 @@ def generate_txt_report(all_results, owner, repo, branch, physical_env, ops_fold
     lines.append("FIN DEL REPORTE")
     lines.append("=" * 90)
     
-    # Guardar archivo
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
         
@@ -302,17 +348,17 @@ def main():
     print("="*70)
     
     try:
-        # 1. Repositorio
-        print("\n📦 REPOSITORIO")
+        # 1. Ruta del archivo de configuración
+        print("\n📄 ARCHIVO DE CONFIGURACIÓN")
         print("-" * 70)
-        repo_in = input("Repositorio (owner/repo): ").strip()
-        if "/" not in repo_in: 
-            raise ValueError("Formato inválido. Usa: owner/repo")
-        owner, repo = repo_in.split("/", 1)
+        cfg_path = input("Ruta del YAML de configuración [DeployConfigStructure.yaml]: ").strip()
+        if not cfg_path: 
+            cfg_path = "DeployConfigStructure.yaml"
         
+        # 2. Rama del repositorio
         branch = input("Rama del repositorio [main]: ").strip() or "main"
         
-        # 2. Token
+        # 3. Token
         print("\n🔑 AUTENTICACIÓN")
         print("-" * 70)
         token = os.getenv("GITHUB_TOKEN")
@@ -324,13 +370,6 @@ def main():
         
         if not token: 
             raise ValueError("Se requiere un token válido para acceder a GitHub")
-        
-        # 3. Archivo de configuración
-        print("\n📄 ARCHIVO DE CONFIGURACIÓN")
-        print("-" * 70)
-        cfg_path = input("Ruta del YAML de configuración [DeployConfigStructure.yaml]: ").strip()
-        if not cfg_path: 
-            cfg_path = "DeployConfigStructure.yaml"
         
         # 4. Parámetros de resolución
         print("\n⚙️  PARÁMETROS DE RESOLUCIÓN")
@@ -349,28 +388,59 @@ def main():
         logical_envs = select_logical_environments()
         print(f"\n✅ Ambientes seleccionados: {', '.join(logical_envs)}")
         
-        # 6. Ejecutar análisis
+        # 6. Leer configuración y extraer repo info
         print("\n" + "="*70)
         print("🚀 INICIANDO ANÁLISIS DE DUPLICADOS")
         print("="*70)
         
         print(f"\n📥 Descargando configuración: {cfg_path}")
-        cfg_content = get_raw_file(cfg_path, branch, owner, repo, token)
+        print("⚠️  Nota: Se deshabilitará la verificación SSL para GitHub Enterprise")
         
-        print("🔄 Resolviendo paths para cada ambiente...")
-        paths_by_env = parse_config_yaml(cfg_content, phys, ops, logical_envs)
+        # Primero necesitamos descargar el archivo de configuración
+        # Pero no sabemos owner/repo todavía... 
+        # Asumimos que el usuario puede proporcionar una URL temporal o usamos una API search
         
+        # Opción: Pedir temporalmente owner/repo solo para descargar el config, 
+        # o pedir la URL completa del archivo de config
+        print("\n📦 Para descargar el archivo de configuración, necesito:")
+        temp_owner = input("Owner del repositorio: ").strip()
+        temp_repo = input("Nombre del repositorio: ").strip()
+        
+        # Descargar YAML de configuración
+        api_base = "https://api.github.com"  # Asumir github.com por defecto
+        try:
+            cfg_content = get_raw_file(cfg_path, branch, temp_owner, temp_repo, token, api_base)
+        except Exception as e:
+            print(f"\n⚠️  No se pudo descargar desde github.com, intentando sin API...")
+            # Si falla, intentar con la URL directa del archivo
+            raise e
+        
+        # Parsear configuración para obtener configPath
+        print("🔄 Parseando configuración...")
+        config_path_url, paths = parse_config_yaml(cfg_content)
+        print(f"✅ Repositorio configurado: {config_path_url}")
+        
+        # Extraer owner y repo reales de configPath
+        owner, repo = extract_repo_info_from_url(config_path_url)
+        api_base_url = get_github_api_base_url(config_path_url)
+        
+        print(f"✅ Owner: {owner}")
+        print(f"✅ Repo: {repo}")
+        print(f"✅ API Base: {api_base_url}")
+        
+        # 7. Ejecutar análisis con la información correcta
         all_results = {}
-        for env_name, paths in paths_by_env.items():
+        for env_name in logical_envs:
+            resolved_paths = resolve_paths(paths, phys, ops, env_name)
             all_results[env_name] = analyze_environment(
-                env_name, paths, branch, owner, repo, token
+                env_name, resolved_paths, branch, owner, repo, token, api_base_url
             )
         
-        # 7. Generar reporte
+        # 8. Generar reporte
         print("\n📊 GENERANDO REPORTE DE DUPLICADOS")
         print("="*70)
         output_file = generate_txt_report(
-            all_results, owner, repo, branch, phys, ops
+            all_results, config_path_url, branch, phys, ops
         )
         
         print("\n" + "="*70)
@@ -388,7 +458,6 @@ def main():
         print("\n\n⚠️  Proceso cancelado por el usuario")
     except FileNotFoundError as e:
         print(f"\n❌ ERROR: Archivo no encontrado - {e}")
-        print("   → Verifica que la ruta del archivo sea correcta en el repositorio")
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
             print(f"\n❌ ERROR: Recurso no encontrado (404)")
