@@ -141,7 +141,7 @@ def generate_txt_report(all_results, owner, repo, branch):
     lines = []
     
     lines.append("=" * 80)
-    lines.append("REPORTE DE DUPLICADOS EN VARIABLES DE ENTORNO KUBERNETES")
+    lines.append("REPORTE DE DUPLICADOS EN LOS OPERATIONS")
     lines.append(f"Generado        : {timestamp}")
     lines.append(f"Repositorio     : {owner}/{repo} (rama: {branch})")
     lines.append(f"Ambientes       : sct, cert0, cert")
