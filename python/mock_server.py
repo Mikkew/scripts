@@ -3,7 +3,7 @@ from fastapi.responses import Response
 import asyncio, json, xmltodict, uvicorn
 from typing import Dict, Any
 
-app = FastAPI(title="Mock Server (JSON/XML)", version="2.0")
+app = FastAPI(title="Mock Server (JSON/XML - Path-Centric)", version="3.0")
 MOCKS: Dict[str, Dict[str, Any]] = {}
 
 def cargar_mocks(archivo: str = "mocks.json"):
@@ -11,24 +11,24 @@ def cargar_mocks(archivo: str = "mocks.json"):
     try:
         with open(archivo, "r", encoding="utf-8") as f:
             MOCKS = json.load(f)
-        print(f"✅ {len(MOCKS)} métodos cargados desde {archivo}")
+        print(f"✅ {len(MOCKS)} rutas cargadas desde {archivo}")
     except FileNotFoundError:
-        print("⚠️ No se encontró mocks.json. Usando valores por defecto.")
-        MOCKS = {}  # Se cargan en tiempo de ejecución o se añade fallback
+        print("⚠️ mocks.json no encontrado. Define tus rutas y métodos.")
+        MOCKS = {}
 
 @app.api_route("/mock/{ruta:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def mock_endpoint(ruta: str, request: Request, format: str = Query(None)):
     metodo = request.method.upper()
     path = f"/{ruta}"
 
-    # 1️⃣ Buscar mock configurado
-    if metodo not in MOCKS or path not in MOCKS[metodo]:
+    # 1️⃣ Validar existencia de ruta y método
+    if path not in MOCKS or metodo not in MOCKS[path]:
         return Response(
-            content=json.dumps({"error": f"Mock no encontrado para {metodo} {path}"}),
+            content=json.dumps({"error": f"Mock no configurado para {metodo} {path}"}),
             media_type="application/json", status_code=404
         )
 
-    mock = MOCKS[metodo][path]
+    mock = MOCKS[path][metodo]
     delay = mock.get("delay", 0)
     if delay > 0:
         await asyncio.sleep(delay)
@@ -38,23 +38,24 @@ async def mock_endpoint(ruta: str, request: Request, format: str = Query(None)):
     headers = mock.get("headers", {})
     tipo_configurado = mock.get("type", "json").lower()
 
-    # 2️⃣ Determinar formato de respuesta
+    # 2️⃣ Resolver formato de respuesta
     accept = request.headers.get("accept", "").lower()
     usar_xml = (format == "xml") or ("application/xml" in accept or "text/xml" in accept)
     usar_json = (format == "json") or ("application/json" in accept)
 
-    # Si no hay override, usar el tipo declarado en el mock
+    # Si no hay override, respetar el tipo declarado en el mock
     if not usar_xml and not usar_json:
         usar_xml = (tipo_configurado == "xml")
 
-    # 3️⃣ Generar respuesta según formato
+    # 3️⃣ Generar payload
     if usar_xml:
         media_type = "application/xml; charset=utf-8"
         if isinstance(body, str):
             content = body
         else:
-            # Convertir dict/lista a XML (envuelve en <response> para mantener raíz válida)
-            content = xmltodict.unparse({"response": body}, pretty=True, full_document=False)
+            # xmltodict requiere dict raíz. Si es lista, se envuelve automáticamente
+            root = "response" if isinstance(body, dict) else "items"
+            content = xmltodict.unparse({root: body}, pretty=True, full_document=False)
     else:
         media_type = "application/json; charset=utf-8"
         content = json.dumps(body, ensure_ascii=False, indent=2) if isinstance(body, (dict, list)) else body
