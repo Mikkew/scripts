@@ -1,0 +1,36 @@
+{
+  "/usuarios": {
+    "GET": {
+      "type": "json",
+      "status": 200,
+      "body": [
+        {"id": 1, "nombre": "Ana", "rol": "admin"},
+        {"id": 2, "nombre": "Luis", "rol": "user"}
+      ],
+      "delay": 0.3
+    },
+    "POST": {
+      "type": "json",
+      "status": 201,
+      "body": {"id": 3, "nombre": "Carlos", "email": "carlos@test.com"},
+      "delay": 0.2
+    }
+  },
+  "/reporte/diario": {
+    "GET": {
+      "type": "xml",
+      "status": 200,
+      "body": "<?xml version=\"1.0\"?><reporte><fecha>2026-05-19</fecha><ventas total=\"1500\"/><estado>cerrado</estado></reporte>",
+      "delay": 0.2
+    }
+  },
+  "/webhook": {
+    "POST": {
+      "type": "json",
+      "status": 202,
+      "body": {"status": "accepted", "tracking_id": "TRK-998877"},
+      "delay": 0.0,
+      "headers": {"X-Webhook-Version": "v2"}
+    }
+  }
+}
